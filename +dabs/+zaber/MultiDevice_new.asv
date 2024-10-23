@@ -1,0 +1,328 @@
+classdef MultiDevice_new < dabs.interfaces.MotorController & most.HasMachineDataFile
+    
+    properties (SetObservable, SetAccess=protected, AbortSet)
+        lastKnownPosition = 0;      % [numeric] [1 x numAxes] sized vector with the last known position of all motors
+        isMoving = false;               % [logical] Scalar that is TRUE only if a move initiated by obj.move OR obj.moveAsync has not finished
+        isHomed = false;        % [logical] Scalar that is TRUE if the motor's absolute position is known relative to its home position
+        errorMsg;               % [char]    Empty string if no error occured. If error occurs, character array specifying the error
+    end
+    
+    properties (SetAccess=protected)
+        numAxes = 3;            % [numeric] Scalar integer describing the number of axes of the MotorController
+    end
+    
+     %%% Abstract property realizations (most.HasMachineDataFile)
+    properties (Constant, Hidden)
+        %Value-Required properties
+        mdfClassName = mfilename('class');
+        mdfHeading = 'MultiDevice';
+        
+        %Value-Optional properties
+        mdfDependsOnClasses; %#ok<MCCPI>
+        mdfDirectProp; %#ok<MCCPI>
+        mdfPropPrefix; %#ok<MCCPI>
+        
+        mdfDefault = defaultMdfSection();
+    end
+    
+    %% Internal Properties
+    properties (SetAccess = private, Hidden)
+       communicationMode = 'Binary';
+       hZaber;
+       resetInProgress = false;
+       
+       aliasNum = 42;
+    end
+    
+    properties
+        hListeners = event.listener.empty(1,0);
+    end
+    
+    %% LIFECYCLE
+    methods
+        function obj = MultiDevice_new(name)
+            obj = obj@dabs.interfaces.MotorController(name);
+            custMdfHeading = sprintf('MultiDevice (%s)',name);
+            obj = obj@most.HasMachineDataFile(true, custMdfHeading);
+            
+            try
+                obj.reinit();
+            catch ME
+                most.ErrorHandler.logAndReportError(ME,['Zaber MultiDevice failed to initialize. Error: ' ME.message]);
+            end
+        end
+        
+        function delete(obj)
+           most.idioms.safeDeleteObj(obj.hListeners);
+           most.idioms.safeDeleteObj(obj.hZaber); 
+        end
+    end
+    
+    methods
+        function reinit(obj)
+            try
+                fprintf('Initializing Zaber MultiDevice...');
+                
+                obj.communicationMode = 'Binary';
+                
+                comPort_ = obj.mdfData.comPort;
+                validateattributes(comPort_,{'numeric'},{'scalar','integer','positive'});
+                
+                most.idioms.safeDeleteObj(obj.hListeners);
+                most.idioms.safeDeleteObj(obj.hZaber);
+                obj.hListeners = event.listener.empty(1,0);
+                
+                obj.hZaber = dabs.zaber.Zaber(comPort_);
+                
+                % Device State Property Setup - Expand for all device
+                % dimensions.
+                obj.isHomed = repmat(obj.isHomed, 1,obj.numAxes);
+                
+                obj.hZaber.homed = repmat(obj.hZaber.homed, 1,obj.numAxes);
+                obj.hZaber.homed_ut = repmat(obj.hZaber.homed_ut, 1,obj.numAxes);
+                
+                obj.hZaber.position = repmat(obj.hZaber.position, 1,obj.numAxes);
+                obj.hZaber.position_ut = repmat(obj.hZaber.position_ut, 1,obj.numAxes);
+                
+                obj.lastKnownPosition = repmat(obj.lastKnownPosition, 1, obj.numAxes);
+                
+                obj.hZaber.isMoving = repmat(obj.hZaber.isMoving, 1,obj.numAxes);
+                obj.hZaber.isMoving_ut = repmat(obj.hZaber.isMoving_ut, 1,obj.numAxes);
+                
+                obj.hZaber.lastError = repmat(obj.hZaber.lastError, 1,obj.numAxes);
+                obj.hZaber.lastError_ut = repmat(obj.hZaber.lastError_ut, 1,obj.numAxes);
+                
+                obj.hZaber.trackingEnabled = repmat(obj.hZaber.trackingEnabled, 1,obj.numAxes);
+                obj.hZaber.stopped_ut = repmat(obj.hZaber.stopped_ut, 1,obj.numAxes);
+                
+                for i = 1:obj.numAxes
+                    obj.hZaber.SET_ALIAS_NUMER(i, obj.aliasNum);
+                end
+                
+                obj.hListeners = [obj.hListeners most.ErrorHandler.addCatchingListener(obj.hZaber,'position','PostSet',@obj.updateLast)];
+                
+                % Check Home State
+                obj.startHoming;
+                
+                % Enable Move Tracking on all devices
+                obj.hZaber.ENABLE_MOVE_TRACKING(obj.aliasNum,1);
+                pause(0.2);
+                
+                % Query all devices for their current position.
+                obj.queryPosition();
+                obj.errorMsg = '';
+                
+                fprintf('...Initialized!\n');
+            catch ME
+                obj.errorMsg = ME.message;
+                ME.rethrow();
+            end
+        end
+        
+        function tf = queryMoving(obj)
+             tf = obj.isMoving;
+        end
+        
+        % THis shoold manually query pos?
+        % lastKnownPosition needs to update whenever the hZaber.position
+        % updates...
+        function position = queryPosition(obj)
+            obj.hZaber.RETURN_CURRENT_POSITION(obj.aliasNum);
+            position = obj.hZaber.position;
+            
+        end
+        
+        function move(obj, position, timeout_s)
+            if nargin < 3 || isempty(timeout_s)
+                timeout_s = obj.defaultTimeout_s;
+            end
+            
+            obj.moveAsync(position);
+            obj.moveWaitForFinish(timeout_s);
+        end
+        
+        function moveAsync(obj, position, callback)
+            if nargin < 3 || isempty(callback)
+                callback = [];
+            end
+            
+            obj.moveStart(position);
+            
+        end
+        
+        function moveWaitForFinish(obj, timeout_s)
+            if nargin < 2 || isempty(timeout_s)
+                timeout_s = obj.defaultTimeout_s;
+            end
+            
+            t = tic;
+            while toc(t) < timeout_s
+                if obj.queryMoving
+                    % Force invoke to avoid delayed callback execution.
+                    obj.hZaber.decodeReply();
+                    pause(0.01);
+                    
+                else
+                    obj.queryPosition();
+                    return
+                end
+            end
+            
+            obj.stop();
+            obj.queryPosition();
+            error('Motor %s: Move timed out.\n',obj.name);
+        end
+        
+        function stop(obj)
+            obj.hZaber.STOP(obj.aliasNum);
+        end
+        
+        function reset(obj)
+            if obj.resetInProgress
+                return;
+            end
+            obj.resetInProgress = true;
+            
+            try
+                obj.hZaber.RESET(obj.aliasNum);
+                pause(0.2);
+                % Check Home State
+                obj.startHoming;
+                
+                % Enable Move Tracking on all devices
+                obj.hZaber.ENABLE_MOVE_TRACKING(obj.aliasNum,1);
+                pause(0.2);
+                % Query all devices for their current position.
+                obj.queryPosition;
+                obj.resetInProgress = false;
+            catch ME
+                obj.resetInProgress = false;
+                obj.errorMsg = ME.message;
+                ME.rethrow();
+            end
+        end
+        
+        function startHoming(obj)
+            obj.deviceHomeProcedure();
+        end
+    end
+    
+    %% 
+    methods (Access=protected,Hidden)
+
+        function moveStart(obj,absTargetPosn)
+            absTargetDevUnits = zeros(1,3);
+            for i = 1:obj.numAxes
+                % Convert um to device units
+                absTargetDevUnits(i) = absTargetPosn(i);
+%                 assert(absTargetDevUnits(i)<=obj.DEVICE_MAX_TICS,'Commanded Move Exceeds Range!');
+                assert(obj.isHomed(i),'Device not homed. Move cancelled.');
+                obj.hZaber.MOVE_ABSOLUTE(i,absTargetDevUnits(i));
+            end           
+        end
+        
+    end
+    
+    methods
+        function updateLast(obj, src, evt, varargin)
+            obj.lastKnownPosition = obj.hZaber.position;
+        end
+        
+        function deviceHomeProcedure(obj)
+            % Request the devices internal home state. Local flags will
+            % be false on startup even though device internal flags may
+            % be true.
+            obj.updateDeviceHomeState;
+            pause(0.2);
+            devicesHomed = obj.isHomed;
+
+            % If any devices are not homed either all devices can be
+            % homed or that specific device can be homed. Alternatively
+            % devices can be left unhomed - not recommended.
+            if any(devicesHomed ~= true)
+                response = questdlg('Zaber stage must home before use. Please ensure clearance of stage before movement!','Zaber Home Warning', 'Continue', 'Cancel', 'Cancel');
+                if strcmp(response, 'Continue')
+                    if numel(find(devicesHomed~=true))> 1
+                        obj.homeDevice(0);
+                    else
+                        obj.homeDevice(find(devicesHomed~=true));
+                    end
+                else
+                    warndlg('One or more Zaber devices might not be homed! It is recommended you home all devices for optimal operation.');
+                end  
+            end
+        end
+        
+        function homeDevice(obj, device)
+            obj.hZaber.GO_HOME(device);
+            while any(obj.hZaber.homed ~= true)
+                pause(0.01);
+            end
+        end
+        
+        function val = get.isHomed(obj)
+            val = obj.hZaber.homed;
+        end
+        
+        % This function will query the device(s) for their internal home
+        % state. Response will be processed and update a zaber homed flag.
+        function updateDeviceHomeState(obj, device)
+            if nargin < 2 || isempty(device)
+               device = 0; 
+            end
+            t = tic;
+            % Commands called with Device ID 0 will be sent to all devices.
+            % If there is only 1 device present this has the same effect as
+            % calling the command with Device ID 1.
+            obj.hZaber.RETURN_HOMED_STATE(device);
+            
+            % If the command called with Device ID 0, timestamp index
+            % should target last device, i.e. wait for all devices to
+            % return. Otherwise index correct device.
+            if device == 0
+                device = obj.numAxes;
+            end
+            
+            while toc(obj.hZaber.homed_ut(device)) > toc(t)
+                assert(toc(t) < 5, 'Timed out waiting for response from Zaber device.');
+                pause(0.1);
+%                 obj.hZaber.decodeReply();
+            end
+        end
+        
+        function tf = get.isMoving(obj)
+            if isempty(obj.hZaber)
+                tf = false;
+            else
+                tf = any(obj.hZaber.isMoving);
+            end
+            obj.isMoving = tf;
+        end
+    end
+end
+
+function s = defaultMdfSection()
+    s = [...
+        makeEntry('comPort',1,'Integer identifying COM port for controller')...
+        ];
+    
+    function se = makeEntry(name,value,comment,liveUpdate)
+        if nargin == 0
+            name = '';
+            value = [];
+            comment = '';
+        elseif nargin == 1
+            comment = name;
+            name = '';
+            value = [];
+        elseif nargin == 2
+            comment = '';
+        end
+        
+        if nargin < 4
+            liveUpdate = false;
+        end
+        
+        se = struct('name',name,'value',value,'comment',comment,'liveUpdate',liveUpdate);
+    end
+end
